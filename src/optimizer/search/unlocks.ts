@@ -90,13 +90,21 @@ function collectBuffDefinitionsFromSkill(
   return buffs;
 }
 
+const expressionGateCache = new WeakMap<BuffDefinition, readonly string[]>();
+
 function collectExpressionGatesFromBuff(buff: BuffDefinition): string[] {
+  // Buff definitions are stable objects for the whole craft, so the gate list is
+  // computed once per definition instead of once per expanded node.
+  const cached = expressionGateCache.get(buff);
+  if (cached) return cached as string[];
+
   const eqns: string[] = [];
   for (const scaling of Object.values(buff.stats ?? {})) {
     if (scaling?.eqn) {
       eqns.push(scaling.eqn);
     }
   }
+  expressionGateCache.set(buff, eqns);
   return eqns;
 }
 

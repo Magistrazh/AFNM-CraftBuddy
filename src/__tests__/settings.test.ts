@@ -190,11 +190,15 @@ describe('settings search budget', () => {
     expect(loadSettings().searchThreads).toBe(1);
   });
 
-  it('resolves auto thread count as min(cores - 2, 4), at least 1', () => {
+  it('resolves auto thread count as min(cores - 2, 12), at least 1', () => {
     expect(resolveSearchThreadCount(1, 16)).toBe(1);
     expect(resolveSearchThreadCount(2, 16)).toBe(2);
     expect(resolveSearchThreadCount(4, 16)).toBe(4);
-    expect(resolveSearchThreadCount('auto', 16)).toBe(4);
+    expect(resolveSearchThreadCount(8, 16)).toBe(8);
+    expect(resolveSearchThreadCount(12, 16)).toBe(12);
+    // A fixed choice still cannot exceed the machine's usable cores.
+    expect(resolveSearchThreadCount(12, 6)).toBe(4);
+    expect(resolveSearchThreadCount('auto', 16)).toBe(12);
     expect(resolveSearchThreadCount('auto', 6)).toBe(4);
     expect(resolveSearchThreadCount('auto', 4)).toBe(2);
     expect(resolveSearchThreadCount('auto', 2)).toBe(1);
@@ -462,4 +466,23 @@ describe('settings search budget', () => {
 
     expect(loaded.preferredAutoModePolicy).toBe(expected);
   });
+
+  it.each(['gpu', 'gpuVerified'] as const)(
+    'pins the beam width to 20 for a saved %s engine',
+    (engine) => {
+      storageData['craftbuddy_settings'] = JSON.stringify({
+        searchEngine: engine,
+        searchBeamWidth: 9,
+      });
+      storageData[SEARCH_DEFAULTS_RESET_VERSION_KEY] =
+        SEARCH_DEFAULTS_RESET_VERSION;
+      storageData[DISPLAY_DEFAULTS_RESET_VERSION_KEY] =
+        DISPLAY_DEFAULTS_RESET_VERSION;
+
+      const loaded = loadSettings();
+
+      expect(loaded.searchEngine).toBe(engine);
+      expect(loaded.searchBeamWidth).toBe(20);
+    },
+  );
 });

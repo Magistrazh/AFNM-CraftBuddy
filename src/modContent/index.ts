@@ -40,7 +40,14 @@ import {
   serializeSearchInput,
   type SearchBackendInput,
   type HarmonyData,
+  type CraftingConditionType,
 } from '../optimizer';
+import {
+  buildParityReport,
+  describeProfile,
+  search,
+  type GpuParityReport,
+} from '../optimizer/gpu';
 import { RecommendationPanel } from '../ui/RecommendationPanel';
 import { createOverlayLayoutController } from '../ui/overlayLayoutController';
 import { CraftBuddyThemeProvider } from '../ui/ThemeProvider';
@@ -114,8 +121,11 @@ import { hydrateHarmonyData, type HarmonyDataSource } from './harmonyState';
 import {
   buildOptimizerReplaySnapshotWithHistory,
   buildConfigSnapshot,
+  buildOptimizerSnapshotDebugEvent,
   buildResultSnapshot,
   buildStateSnapshot,
+  reviveConfigSnapshot,
+  reviveStateSnapshot,
   sanitizeForJson,
   type OptimizerReplayAutoCraftSnapshot,
   type OptimizerReplayInputSnapshot,
@@ -164,9 +174,25 @@ import {
   type InventoryItemLike,
 } from './craftStateExtraction';
 import { getModApiNextConditionResolver } from './modApiProviders';
-import { integrationDiagnostics } from './craftSession';
+import {
+  integrationDiagnostics,
+  setGpuSearchFallbackReason,
+  setGpuSearchStatus,
+} from './craftSession';
+import { selectGpuRoots } from './gpuRootSelection';
+import { replayGpuPaths } from './gpuPathSearch';
+import { tryGpuRecommendation } from './statefulGpuRecommendation';
+import { gpuDebugEnabled, gpuDebugLog } from '../optimizer/gpu/debug';
 import { getCraftBuddyHotkeyAction } from './hotkeys';
 import { debugLog } from '../utils/debug';
+import { emitDebugEvent } from '../utils/debugSink';
+import { initDebugSink } from './debugSink';
+import {
+  emitRecalculateResult,
+  emitRecalculateStart,
+  type RecalculateResultInfo,
+  type RecalculateResultListener,
+} from './recalculateDiagnostics';
 import { checkPrecision, parseGameNumber } from '../utils/largeNumbers';
 import { computeOverlayLayout } from '../utils/overlayLayout';
 
@@ -176,6 +202,14 @@ declare const MOD_METADATA: {
   author: { name: string } | string;
   description: string;
 };
+
+/**
+ * Ceiling for a GPU-assisted search: the mode's promise is a sub-second answer.
+ * Measured against a 2000 ms full search on the 17 fixtures this loses quality
+ * on a few states, so the status line states the cap and the engine still owns
+ * every number.
+ */
+const GPU_HYBRID_BUDGET_MS = 1000;
 
 // Global state for the optimizer
 let currentRecommendation: SearchResult | null = null;
@@ -231,6 +265,8 @@ let autoCraftUiState: AutoCraftUiState = createDefaultAutoCraftUiState(
 // Calculation state tracking for loading indicator
 let isCalculating = false;
 let recommendationSearchEpoch = 0;
+/** `gpuVerified` runs its plain-engine comparison once per craft, not per step. */
+let verifiedCompareDoneForCraft = false;
 
 // Cross-step transposition cache for the synchronous search backend. One
 // instance here; the worker pool holds one per worker instead.
@@ -751,6 +787,7 @@ function buildOptimizerReplayInputSnapshot(params: {
       overcraftAmbition: params.searchConfig.overcraftAmbition,
     },
     settings: {
+      searchEngine: currentSettings.searchEngine,
       lookaheadDepth: currentSettings.lookaheadDepth,
       searchTimeBudgetMs: currentSettings.searchTimeBudgetMs,
       searchMaxNodes: currentSettings.searchMaxNodes,
@@ -791,6 +828,64 @@ function getSerializableOptimizerReplaySnapshot(): {
   const data = sanitizeForJson(lastOptimizerReplaySnapshot);
   const json = JSON.stringify(data, null, 2);
   return { data, json };
+}
+
+/**
+ * Full replay snapshots are 100-300 KB in real captures, far above the sink's
+ * 4000-byte default (which silently drops oversized events). Emit the complete
+ * sanitized payload once, with an explicit bounded cap so it still lands in
+ * the local jsonl receiver instead of being trimmed into uselessness.
+ */
+const OPTIMIZER_SNAPSHOT_BODY_LIMIT = 2 * 1024 * 1024;
+
+function emitOptimizerSnapshotDebugEvent(): void {
+  const prepared = getSerializableOptimizerReplaySnapshot();
+  if (!prepared) return;
+  emitDebugEvent(buildOptimizerSnapshotDebugEvent(prepared), {
+    maxBodyLength: OPTIMIZER_SNAPSHOT_BODY_LIMIT,
+  });
+}
+
+/**
+ * Compute the GPU parity report for the state described by the snapshot that
+ * is about to be exported. All failures stay in the report; nothing reaches
+ * the hotkey handler as a rejected promise.
+ */
+async function buildGpuParityForExport(): Promise<GpuParityReport> {
+  const snapshot = lastOptimizerReplaySnapshot;
+  let report: GpuParityReport;
+  if (!snapshot || !wasCraftingActive || !lastEntity || !lastProgressState) {
+    report = { available: false, reason: 'no craft' };
+  } else {
+    try {
+      report = await buildParityReport(
+        reviveStateSnapshot(snapshot.input.state),
+        reviveConfigSnapshot(snapshot.input.config),
+        snapshot.input.conditions.current,
+      );
+    } catch (error) {
+      report = {
+        available: false,
+        reason:
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+      };
+    }
+  }
+
+  emitDebugEvent({
+    kind: 'parity',
+    available: report.available,
+    reason: report.available ? null : report.reason,
+    compared: report.available ? report.compared : 0,
+    mismatches: report.available ? report.mismatches.length : 0,
+    roots: report.available ? (report.roots ?? []).map((root) => root.name) : [],
+    profile: report.profile ? describeProfile(report.profile) : null,
+    adapter: report.adapter ? { ...report.adapter } : null,
+  });
+
+  return report;
 }
 
 /**
@@ -1527,6 +1622,7 @@ function updateRecommendation(
   trainingMode: boolean = false,
   recipeStats?: CraftingRecipeStats,
   recipe?: RecipeItem,
+  onSettled?: RecalculateResultListener,
 ): void {
   // Ensure native providers are wired now that modAPI may be available
   ensureNativeProvidersInitialized();
@@ -1848,40 +1944,134 @@ function updateRecommendation(
   });
 
   const runRecommendationSearch = async (): Promise<void> => {
+    let recalcResult: RecalculateResultInfo | null = null;
     try {
-      const threads = resolveSearchThreadCount(
-        currentSettings.searchThreads,
-        typeof navigator !== 'undefined'
-          ? navigator.hardwareConcurrency
-          : undefined,
-      );
-      const backendInput: SearchBackendInput = {
-        state,
-        config,
-        targetCompletion: targetCompletionAtSearchStart,
-        targetPerfection: targetPerfectionAtSearchStart,
-        lookaheadDepth,
-        currentCondition: currentConditionType as CraftingCondition | undefined,
-        forecast: forecastedConditionTypes as CraftingCondition[],
-        searchConfig,
-      };
-      const outcome = await requestWorkerSearch({
-        epoch: searchEpoch,
-        scope: crossStepScope ?? 'unscoped',
-        threads,
-        rootSkillKeys: [...config.skills.map((skill) => skill.key)],
-        input: serializeSearchInput(backendInput),
-      });
-      if (
-        outcome.kind === 'stale' ||
-        searchEpoch !== recommendationSearchEpoch
-      ) {
-        return;
+      const engineAtStart = currentSettings.searchEngine;
+      const allSkillKeys = [...config.skills.map((skill) => skill.key)];
+      let rootSkillKeys = allSkillKeys;
+      let effectiveSearchConfig = searchConfig;
+      let hybridStatus = '';
+      let gpuTopName = '';
+      let gpuPathRecommendation: SearchResult | null = null;
+      let gpuPathPickName = '';
+      let gpuPathFallbackReason = '';
+      let gpuPathBackend = 'gpu-path';
+
+      // S7b: the self-contained stateful search is the primary GPU proposal.
+      // It owns its own refusals; a refusal leaves the old GPU/JS ladder below
+      // completely unchanged. No exception reaches the recommendation UI.
+      if (engineAtStart === 'gpu' || engineAtStart === 'gpuVerified') {
+        let stateful:
+          | Awaited<ReturnType<typeof tryGpuRecommendation>>
+          | null = null;
+        try {
+          stateful = await tryGpuRecommendation({
+            state,
+            config,
+            skills: config.skills,
+            completion: targetCompletionAtSearchStart,
+            perfection: targetPerfectionAtSearchStart,
+            lookaheadDepth,
+            condition: currentConditionType as CraftingConditionType | undefined,
+            forecast: forecastedConditionTypes as CraftingConditionType[],
+            searchConfig,
+          });
+        } catch (error) {
+          // Defensive: the helper is contractually non-throwing. Never turn a
+          // backend glitch into a failed recommendation.
+          gpuDebugLog(`stateful-wiring unexpected error=${String(error)}`);
+        }
+        if (searchEpoch !== recommendationSearchEpoch) {
+          return;
+        }
+        if (stateful && stateful.ok) {
+          gpuPathRecommendation = stateful.result;
+          gpuPathPickName = stateful.chosenName;
+          gpuPathFallbackReason = '';
+          gpuPathBackend = 'gpu-stateful';
+          hybridStatus = stateful.status;
+          setGpuSearchStatus(hybridStatus);
+          setGpuSearchFallbackReason('');
+        } else if (stateful && !stateful.ok) {
+          gpuPathFallbackReason = stateful.reason;
+        }
       }
-      const recommendation =
-        outcome.kind === 'result'
-          ? outcome.result
-          : findBestSkill(
+
+      // The GPU only proposes sequences. Every number shown to the player still
+      // comes from the engine: replay verifies a proposal, then the engine runs
+      // one search restricted to that proposal's opening.
+      if (
+        (engineAtStart === 'gpu' || engineAtStart === 'gpuVerified') &&
+        !gpuPathRecommendation
+      ) {
+        try {
+          const gpu = await search(state, config, config.skills, {
+            currentCondition: currentConditionType,
+            depth: 6,
+            beamWidth: 1000,
+            timeoutMs: 2500,
+            disableOnTimeout: false,
+          });
+          if (searchEpoch !== recommendationSearchEpoch) {
+            return;
+          }
+          // Notes mean the records lacked data (unknown effect/condition or an
+          // overflow). Plausible paths built on such records must not be trusted.
+          const noteKeys = Object.keys(gpu.notes ?? {});
+          if (noteKeys.length > 0) {
+            const summary = noteKeys
+              .slice(0, 3)
+              .map((key) => `${key}=${gpu.notes[key]}`)
+              .join('; ');
+            gpuPathFallbackReason = `неполные записи GPU: ${summary}`;
+            emitDebugEvent({
+              kind: 'gpu-paths',
+              proposed: gpu.paths.length,
+              valid: 0,
+              bestScore: null,
+              bestPath: [],
+              chosen: null,
+              replayMs: 0,
+              reason: gpuPathFallbackReason,
+            });
+          } else {
+          const replayStart = performance.now();
+          const replays = replayGpuPaths(
+            state,
+            config,
+            currentConditionType,
+            {
+              completion: targetCompletionAtSearchStart,
+              perfection: targetPerfectionAtSearchStart,
+              searchConfig,
+            },
+            gpu.paths,
+          );
+          const replayMs = performance.now() - replayStart;
+          const best = replays[0];
+          const chosenSkill = best
+            ? config.skills.find((skill) => skill.name === best.path.skills[0])
+            : undefined;
+          gpuPathFallbackReason = best
+            ? chosenSkill
+              ? ''
+              : 'первый ход GPU-пути не найден в наборе приёмов'
+            : 'ни один GPU-путь не прошёл проверку';
+          emitDebugEvent({
+            kind: 'gpu-paths',
+            proposed: gpu.paths.length,
+            valid: replays.length,
+            bestScore: best ? best.score : null,
+            bestPath: best ? [...best.path.skills] : [],
+            chosen: chosenSkill ? chosenSkill.name : null,
+            replayMs,
+            reason: gpuPathFallbackReason || null,
+          });
+          if (best && chosenSkill) {
+            gpuPathPickName = chosenSkill.name;
+            gpuPathFallbackReason = '';
+            // One normal engine search, restricted to the verified opening.
+            gpuPathRecommendation = findBestSkill(
               state,
               config,
               targetCompletionAtSearchStart,
@@ -1890,13 +2080,251 @@ function updateRecommendation(
               lookaheadDepth,
               currentConditionType,
               forecastedConditionTypes,
-              searchConfig,
+              {
+                ...searchConfig,
+                rootSkillKeys: [chosenSkill.key],
+                timeBudgetMs: Math.min(searchConfig.timeBudgetMs, 500),
+              },
             );
+            if (searchEpoch !== recommendationSearchEpoch) {
+              return;
+            }
+            hybridStatus =
+              `GPU: путей ${gpu.paths.length}, проверено ${replays.length}, ` +
+              `ход ${chosenSkill.name}, ${replayMs.toFixed(0)} мс`;
+            setGpuSearchStatus(hybridStatus);
+            setGpuSearchFallbackReason('');
+            gpuDebugLog(
+              `gpu-paths proposed=${gpu.paths.length} valid=${replays.length} ` +
+                `bestScore=${best.score.toFixed(2)} chosen=${chosenSkill.name} ` +
+                `replayMs=${replayMs.toFixed(1)} ` +
+                `budgetMs=${Math.min(searchConfig.timeBudgetMs, 500)}`,
+            );
+          }
+          }
+        } catch (error) {
+          gpuPathFallbackReason = `поиск путей GPU недоступен: ${String(error)}`;
+          gpuDebugLog(`gpu-paths error=${gpuPathFallbackReason}`);
+        }
+      }
+
+      if (engineAtStart !== 'js' && !gpuPathRecommendation) {
+        // Secondary path: root-ranking hybrid (or full search). The engine
+        // still evaluates every survivor exactly; a path failure widens roots.
+        const selection = await selectGpuRoots({
+          state,
+          config,
+          targetCompletion: targetCompletionAtSearchStart,
+          targetPerfection: targetPerfectionAtSearchStart,
+          depth: lookaheadDepth,
+          condition: currentConditionType,
+          forecast: forecastedConditionTypes,
+          searchConfig,
+        });
+        if (searchEpoch !== recommendationSearchEpoch) {
+          return;
+        }
+        emitDebugEvent({
+          kind: 'gpu-roots',
+          available: selection.ok,
+          reason: selection.ok ? null : selection.reason,
+          roots: selection.ok ? selection.selection.roots : [],
+          greedyRoots: selection.ok ? selection.selection.greedyRoots : [],
+          gpuRoots: selection.ok ? selection.selection.gpuRoots : [],
+          rankingMs: selection.ok ? selection.selection.rankingMs : null,
+          greedyMs: selection.ok ? selection.selection.greedyMs : null,
+          profile:
+            selection.ok && selection.selection.profile
+              ? describeProfile(selection.selection.profile)
+              : null,
+        });
+        if (selection.ok) {
+          rootSkillKeys = selection.selection.roots;
+          // Keep the path-replay failure visible when the secondary hybrid
+          // path takes over, instead of silently reporting a clean GPU run.
+          hybridStatus = gpuPathFallbackReason
+            ? `${selection.selection.status}; пути GPU: ${gpuPathFallbackReason}`
+            : selection.selection.status;
+          gpuTopName = selection.selection.gpuTopName;
+          effectiveSearchConfig = {
+            ...searchConfig,
+            timeBudgetMs: Math.min(
+              searchConfig.timeBudgetMs,
+              GPU_HYBRID_BUDGET_MS,
+            ),
+          };
+          setGpuSearchFallbackReason(gpuPathFallbackReason);
+          setGpuSearchStatus(hybridStatus);
+          gpuDebugLog(
+            `hybrid roots=${rootSkillKeys.length} ` +
+              `greedy=${selection.selection.greedyRoots.length} ` +
+              `gpu=${selection.selection.gpuRoots.length} ` +
+              `rankingMs=${selection.selection.rankingMs} ` +
+              `budgetMs=${effectiveSearchConfig.timeBudgetMs}`,
+          );
+        } else {
+          const reason = gpuPathFallbackReason
+            ? `${gpuPathFallbackReason}; ${selection.reason}`
+            : selection.reason;
+          setGpuSearchStatus('');
+          setGpuSearchFallbackReason(reason);
+          gpuDebugLog(
+            `fallback engine=${currentSettings.searchEngine} reason=${reason}`,
+          );
+        }
+      } else if (engineAtStart === 'js') {
+        setGpuSearchStatus('');
+        setGpuSearchFallbackReason('');
+      }
+      const threads = resolveSearchThreadCount(
+        currentSettings.searchThreads,
+        typeof navigator !== 'undefined'
+          ? navigator.hardwareConcurrency
+          : undefined,
+      );
+      let recommendation: SearchResult;
+      let backendKind: string;
+      if (gpuPathRecommendation) {
+        recommendation = gpuPathRecommendation;
+        backendKind = gpuPathBackend;
+      } else {
+        const backendInput: SearchBackendInput = {
+          state,
+          config,
+          targetCompletion: targetCompletionAtSearchStart,
+          targetPerfection: targetPerfectionAtSearchStart,
+          lookaheadDepth,
+          currentCondition: currentConditionType as CraftingCondition | undefined,
+          forecast: forecastedConditionTypes as CraftingCondition[],
+          searchConfig: effectiveSearchConfig,
+        };
+        const outcome = await requestWorkerSearch({
+          epoch: searchEpoch,
+          scope: crossStepScope ?? 'unscoped',
+          threads,
+          rootSkillKeys,
+          input: serializeSearchInput(backendInput),
+        });
+        if (
+          outcome.kind === 'stale' ||
+          searchEpoch !== recommendationSearchEpoch
+        ) {
+          return;
+        }
+        recommendation =
+          outcome.kind === 'result'
+            ? outcome.result
+            : findBestSkill(
+                state,
+                config,
+                targetCompletionAtSearchStart,
+                targetPerfectionAtSearchStart,
+                false,
+                lookaheadDepth,
+                currentConditionType,
+                forecastedConditionTypes,
+                searchConfig,
+              );
+        backendKind = outcome.kind;
+      }
       if (searchEpoch !== recommendationSearchEpoch) {
         return;
       }
+      // 'GPU + check' runs one plain-engine search per craft and only reports
+      // agreement. Its result is discarded: the engine result chosen above is
+      // always the one shown and executed.
+      if (engineAtStart === 'gpuVerified' && !verifiedCompareDoneForCraft) {
+        verifiedCompareDoneForCraft = true;
+        const plain = findBestSkill(
+          state,
+          config,
+          targetCompletionAtSearchStart,
+          targetPerfectionAtSearchStart,
+          false,
+          lookaheadDepth,
+          currentConditionType,
+          forecastedConditionTypes,
+          searchConfig,
+        );
+        const enginePick = plain.recommendation?.skill.name ?? '';
+        const engineScore = plain.recommendation?.score ?? null;
+        const gpuPick = gpuPathPickName || gpuTopName;
+        const agree = Boolean(gpuPick) && enginePick === gpuPick;
+        gpuDebugLog(
+          `verified-compare enginePick=${enginePick} engineScore=${engineScore} gpuPick=${gpuPick} agree=${agree}`,
+        );
+        emitDebugEvent({
+          kind: 'verified-compare',
+          enginePick,
+          engineScore,
+          gpuPick,
+          agree,
+        });
+        // A used path already set its own status; keep it untouched.
+        if (!gpuPathRecommendation && gpuTopName) {
+          setGpuSearchStatus(
+            `${hybridStatus}, бюджет ${(effectiveSearchConfig.timeBudgetMs / 1000).toFixed(1)} с, сверка: ${
+              agree ? 'совпало' : `GPU ${gpuPick} ≠ ${enginePick || '—'}`
+            }`,
+          );
+        }
+      }
 
       currentRecommendation = recommendation;
+
+      emitDebugEvent({
+        kind: 'recommendation',
+        engine: engineAtStart,
+        settings: {
+          lookaheadDepth,
+          searchTimeBudgetMs: currentSettings.searchTimeBudgetMs,
+          searchMaxNodes: currentSettings.searchMaxNodes,
+          searchBeamWidth: currentSettings.searchBeamWidth,
+        },
+        metrics: {
+          timeTakenMs: recommendation.searchMetrics?.timeTakenMs ?? null,
+          depthReached: recommendation.searchMetrics?.depthReached ?? null,
+          nodesExplored: recommendation.searchMetrics?.nodesExplored ?? null,
+          cacheHits: recommendation.searchMetrics?.cacheHits ?? null,
+        },
+        pick: recommendation.recommendation?.skill.name ?? null,
+        score: recommendation.recommendation?.score ?? null,
+        plan: recommendation.optimalRotation ?? [],
+      });
+      // The real result path: every branch that reaches this point has a
+      // verified recommendation, whatever backend produced it.
+      recalcResult = {
+        ok: true,
+        engine: engineAtStart,
+        pick: recommendation.recommendation?.skill.name ?? null,
+        score: recommendation.recommendation?.score ?? null,
+      };
+
+      // Measurement hook: expose search cost so external tooling (the chat panel
+      // bridge) can compare thread counts without opening devtools.
+      const searchMetrics = recommendation.searchMetrics;
+      if (searchMetrics) {
+        const metricsWindow = window as unknown as {
+          __craftbuddyMetrics?: Array<Record<string, unknown>>;
+        };
+        const history = metricsWindow.__craftbuddyMetrics ?? [];
+        history.push({
+          at: Date.now(),
+          step: state.step,
+          threads,
+          backend: backendKind,
+          nodes: searchMetrics.nodesExplored,
+          cacheHits: searchMetrics.cacheHits,
+          timeMs: searchMetrics.timeTakenMs,
+          depth: searchMetrics.depthReached,
+          skills: config.skills.length,
+          recommended: recommendation.recommendation?.skill?.name ?? null,
+          earlyExit: searchMetrics.earlyExit?.reason ?? null,
+          stablePasses: searchMetrics.earlyExit?.stablePasses ?? null,
+        });
+        if (history.length > 200) history.splice(0, history.length - 200);
+        metricsWindow.__craftbuddyMetrics = history;
+      }
       currentOptimizerReplayTurn = {
         ...(currentOptimizerReplayTurn ?? {
           sequence: optimizerReplayTurnSequence,
@@ -1930,6 +2358,13 @@ function updateRecommendation(
       console.error('[CraftBuddy] Failed to calculate recommendation:', e);
       const errorMessage =
         e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      recalcResult = {
+        ok: false,
+        engine: currentSettings.searchEngine,
+        pick: null,
+        score: null,
+        reason: errorMessage,
+      };
       currentOptimizerReplayTurn = {
         ...(currentOptimizerReplayTurn ?? {
           sequence: optimizerReplayTurnSequence,
@@ -1947,6 +2382,20 @@ function updateRecommendation(
       }
       currentRecommendation = null;
     } finally {
+      // Report through the panel-triggered listener on every path, including
+      // a superseded search (its epoch check returns early above). The caller
+      // owns the start timestamp, so it adds elapsed time to this result.
+      if (onSettled) {
+        onSettled(
+          recalcResult ?? {
+            ok: false,
+            engine: null,
+            pick: null,
+            score: null,
+            reason: 'superseded',
+          },
+        );
+      }
       if (searchEpoch !== recommendationSearchEpoch) {
         return;
       }
@@ -1964,6 +2413,9 @@ function updateRecommendation(
         };
       }
       refreshOptimizerReplaySnapshot();
+      // Emit after the recommendation event above, once the turn has its
+      // output: the receiver gets a complete, self-contained snapshot line.
+      emitOptimizerSnapshotDebugEvent();
 
       // Update the overlay with results
       renderOverlay();
@@ -2035,7 +2487,18 @@ function handleSettingsChange(newSettings: CraftBuddySettings): void {
   const policyChanged =
     currentSettings.preferredAutoModePolicy !==
     newSettings.preferredAutoModePolicy;
+  const searchEngineChanged =
+    currentSettings.searchEngine !== newSettings.searchEngine;
   currentSettings = newSettings;
+  if (searchEngineChanged) {
+    setGpuSearchStatus('');
+    setGpuSearchFallbackReason('');
+    gpuDebugLog(
+      `setting applied searchEngine=${newSettings.searchEngine} reason=${
+        newSettings.searchEngine === 'js' ? 'none' : 'applies on the next search'
+      }`,
+    );
+  }
   if (policyChanged)
     autoCraftController.setPolicy(newSettings.preferredAutoModePolicy);
   if (!newSettings.panelVisible && autoCraftUiState.armed) {
@@ -2045,12 +2508,41 @@ function handleSettingsChange(newSettings: CraftBuddySettings): void {
 }
 
 function handleRecalculate(): void {
-  if (lastEntity && lastProgressState) {
-    const inventoryItems = cachedStore?.getState?.()?.inventory?.items as
-      | InventoryItemLike[]
-      | undefined;
-    updateRecommendation(lastEntity, lastProgressState, inventoryItems);
+  const searchConfig = getSearchConfig();
+  const startInfo = {
+    searchEngine: currentSettings.searchEngine,
+    lookaheadDepth: currentSettings.lookaheadDepth,
+    timeBudgetMs: searchConfig.timeBudgetMs,
+    maxNodes: searchConfig.maxNodes,
+    beamWidth: searchConfig.beamWidth,
+    step: currentStep,
+    condition: currentCondition ?? null,
+  };
+  if (!lastEntity || !lastProgressState) {
+    emitRecalculateStart({ ...startInfo, ok: false, reason: 'no craft' });
+    return;
   }
+
+  const startedAt = performance.now();
+  emitRecalculateStart({ ...startInfo, ok: true });
+  const inventoryItems = cachedStore?.getState?.()?.inventory?.items as
+    | InventoryItemLike[]
+    | undefined;
+  updateRecommendation(
+    lastEntity,
+    lastProgressState,
+    inventoryItems,
+    0,
+    false,
+    undefined,
+    undefined,
+    (result) => {
+      emitRecalculateResult({
+        ...result,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    },
+  );
 }
 
 function handleAutoModePolicyChange(policy: AutoCraftPolicy): void {
@@ -2185,6 +2677,7 @@ function showOverlay({ sync = false }: { sync?: boolean } = {}): void {
  */
 function clearActiveCraftingRuntimeState(): void {
   recommendationSearchEpoch++;
+  verifiedCompareDoneForCraft = false;
   lastEntity = null;
   lastProgressState = null;
   lastKnownCraftingTechniques = undefined;
@@ -2493,7 +2986,9 @@ function detectCraftResultUi(): boolean {
   const hasResultCue =
     visibleText.includes('craft success') ||
     visibleText.includes('perfect craft') ||
-    visibleText.includes('craft result');
+    visibleText.includes('craft result') ||
+    visibleText.includes('изделие') ||
+    visibleText.includes('результат создания');
 
   if (!hasResultCue) {
     return false;
@@ -2513,7 +3008,12 @@ function detectCraftResultUi(): boolean {
         .toLowerCase()
         .trim();
 
-      return label === 'return' || label.includes('return');
+      return (
+        label === 'return' ||
+        label.includes('return') ||
+        label.includes('вернуться') ||
+        label.includes('назад')
+      );
     },
   );
 }
@@ -2527,22 +3027,22 @@ function detectVisibleCraftingUi(): boolean {
   const stabilityElement = findVisibleCraftingProgressElement(
     gameRoot,
     '[class*="stability"]',
-    /Stability:/i,
+    /Stability:|Стабильность/i,
   );
   const completionElement = findVisibleCraftingProgressElement(
     gameRoot,
     '[class*="completion"]',
-    /Completion:/i,
+    /Completion:|Завершённость|Завершенность/i,
   );
   const perfectionElement = findVisibleCraftingProgressElement(
     gameRoot,
     '[class*="perfection"]',
-    /Perfection:/i,
+    /Perfection:|Совершенство/i,
   );
   const poolElement = findVisibleCraftingProgressElement(
     gameRoot,
     '[class*="pool"], [class*="qi"]',
-    /(?:Qi|Pool):/i,
+    /(?:Qi|Pool|Ци):/i,
   );
 
   const interactiveElements = gameRoot.querySelectorAll(
@@ -3872,19 +4372,17 @@ try {
   },
 
   exportOptimizerReplaySnapshot: async () => {
-    const prepared = getSerializableOptimizerReplaySnapshot();
-    if (!prepared) {
-      console.warn(
-        '[CraftBuddy] No optimizer replay snapshot available yet. Run one recommendation first.',
-      );
-      showDebugToast(
-        'No snapshot yet. Trigger a recommendation first.',
-        'warn',
-      );
-      return { copied: false, downloaded: false };
-    }
+    const gpu = await buildGpuParityForExport();
+    integrationDiagnostics.gpuProfileSummary = gpu.available
+      ? describeProfile(gpu.profile)
+      : `gpu unavailable: ${gpu.reason}`;
+    const snapshot = lastOptimizerReplaySnapshot;
+    const data: OptimizerReplaySnapshot | { gpu: GpuParityReport } = snapshot
+      ? { ...snapshot, gpu }
+      : { gpu };
+    const json = JSON.stringify(sanitizeForJson(data), null, 2);
 
-    const copied = await copyTextToClipboard(prepared.json);
+    const copied = await copyTextToClipboard(json);
     if (copied) {
       console.log(
         '[CraftBuddy] Optimizer replay snapshot bundle copied to clipboard.',
@@ -3898,7 +4396,7 @@ try {
 
     const dateStamp = new Date().toISOString().replace(/[:.]/g, '-');
     const fileName = `craftbuddy-optimizer-snapshot-${dateStamp}.json`;
-    const downloaded = downloadTextFile(fileName, prepared.json);
+    const downloaded = downloadTextFile(fileName, json);
     if (downloaded) {
       console.log(
         `[CraftBuddy] Clipboard unavailable. Downloaded snapshot bundle as ${fileName}`,
@@ -3974,6 +4472,11 @@ try {
 }
 
 // Initialize
+initDebugSink({
+  version: MOD_METADATA.version,
+  gpuDebug: gpuDebugEnabled,
+  searchEngine: currentSettings.searchEngine,
+});
 // Verified in the installed 0.7.19 Game.js: this lives on gameData; the
 // published declarations currently place it elsewhere. Keep that drift local.
 const nativeOptionsGameData = window.modAPI

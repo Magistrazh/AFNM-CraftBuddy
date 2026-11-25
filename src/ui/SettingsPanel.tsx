@@ -38,6 +38,12 @@ import {
   resetOverlayGeometry,
   subscribeOverlayGeometry,
 } from '../settings/overlayGeometry';
+import {
+  getGpuSearchFallbackReason,
+  getGpuSearchStatus,
+  subscribeGpuSearchFallbackReason,
+} from '../modContent/craftSession';
+import { probeCapability, type GpuCapability } from '../optimizer/gpu';
 import { formatAmbitionBands } from './ambitionBands';
 import {
   formatSearchGoalPriorityBias,
@@ -63,6 +69,17 @@ import {
   focusRing,
 } from './theme';
 import { ChoiceGroup } from './components/ChoiceGroup';
+import {
+  allowSliderCommit,
+  budgetMatchesSettings,
+  engineChangePatch,
+  GPU_BEAM_WIDTH,
+  isGpuSearchEngine,
+  presetChangePatch,
+} from './gpuBeamLock';
+
+const GPU_BEAM_NOTE =
+  'GPU kernel uses 20 branches; locked while a GPU engine is selected.';
 
 interface SettingsPanelProps {
   onSettingsChange?: (settings: CraftBuddySettings) => void;
@@ -84,6 +101,41 @@ const PERFECTION_BAND_GOAL_HELP =
   'Auto aims for the recipe’s target tier. Choose more bands to keep working toward extra stars.';
 const COMPLETION_BAND_CEILING_HELP =
   'Auto follows the recipe. A lower ceiling redirects spare turns toward perfection, without lowering the tier requirement.';
+
+const SEARCH_ENGINE_OPTIONS = [
+  { id: 'js', label: 'JS', detail: 'Default and reference engine.' },
+  { id: 'gpu', label: 'GPU', detail: 'Experimental.' },
+  {
+    id: 'gpuVerified',
+    label: 'GPU + check',
+    detail: 'Compares with JS on the first search of a craft.',
+  },
+] as const;
+
+// The probe is only run when settings are actually shown. Its result is cached
+// for the session so reopening the dialog never re-probes the adapter.
+let cachedGpuCapability: GpuCapability | null = null;
+let gpuCapabilityProbe: Promise<GpuCapability> | null = null;
+
+function probeGpuCapabilityOnce(): Promise<GpuCapability> {
+  if (cachedGpuCapability) return Promise.resolve(cachedGpuCapability);
+  if (!gpuCapabilityProbe) {
+    gpuCapabilityProbe = probeCapability()
+      .then((capability) => {
+        cachedGpuCapability = capability;
+        return capability;
+      })
+      .catch((error: unknown) => {
+        const capability: GpuCapability = {
+          available: false,
+          reason: `WebGPU: проверка завершилась ошибкой (${String(error)})`,
+        };
+        cachedGpuCapability = capability;
+        return capability;
+      });
+  }
+  return gpuCapabilityProbe;
+}
 
 type SearchSettingKey =
   | 'lookaheadDepth'
@@ -119,6 +171,8 @@ const SliderSetting = memo(function SliderSetting({
   marks = false,
   directional = false,
   endLabels,
+  disabled = false,
+  note,
 }: {
   label: string;
   tooltip: string;
@@ -132,6 +186,9 @@ const SliderSetting = memo(function SliderSetting({
   directional?: boolean;
   /** Overrides the formatted min/max shown under the track. */
   endLabels?: readonly [string, string];
+  disabled?: boolean;
+  /** Explanation shown under the track when the slider is locked. */
+  note?: string;
 }) {
   // Dragging updates this control only. Persist/render the root once on commit;
   // CSS owns sizing, so there are no synchronous layout probes on each tick.
@@ -151,7 +208,10 @@ const SliderSetting = memo(function SliderSetting({
           id={id}
           component="span"
           variant="body1"
-          sx={{ fontWeight: 550 }}
+          sx={{
+            fontWeight: 550,
+            color: disabled ? colors.textDisabled : undefined,
+          }}
         >
           {label}
         </Typography>
@@ -170,6 +230,13 @@ const SliderSetting = memo(function SliderSetting({
             fontSize: tokens.type.body,
             fontWeight: 650,
             flexShrink: 0,
+            ...(disabled
+              ? {
+                  borderColor: tokens.border.hairline,
+                  backgroundColor: tokens.surface.control,
+                  color: colors.textDisabled,
+                }
+              : {}),
           }}
         >
           {format(draft)}
@@ -182,11 +249,18 @@ const SliderSetting = memo(function SliderSetting({
         max={max}
         step={step}
         value={draft}
+        disabled={disabled}
         marks={directional ? [{ value: 0 }] : marks}
         track={directional ? false : 'normal'}
-        onChange={(_, value) => setDraft(Number(value))}
-        onChangeCommitted={(_, value) => onCommit(Number(value))}
-        onBlur={() => onCommit(draft)}
+        onChange={(_, value) => {
+          if (!disabled) setDraft(Number(value));
+        }}
+        onChangeCommitted={(_, value) => {
+          if (!disabled) onCommit(Number(value));
+        }}
+        onBlur={() => {
+          if (!disabled) onCommit(draft);
+        }}
       />
       <Box
         aria-hidden
@@ -216,6 +290,15 @@ const SliderSetting = memo(function SliderSetting({
           </>
         )}
       </Box>
+      {note && (
+        <Typography
+          component="p"
+          variant="body2"
+          sx={{ color: colors.textDisabled, mt: 0.5, mb: 0 }}
+        >
+          {note}
+        </Typography>
+      )}
     </Box>
   );
 });
@@ -335,7 +418,30 @@ export function SettingsBody({
     getSettings,
   );
   const draftSettings = settings;
+  const gpuMode = isGpuSearchEngine(settings.searchEngine);
   const [exportStatus, setExportStatus] = useState('');
+  const [gpuCapability, setGpuCapability] = useState<GpuCapability | null>(
+    null,
+  );
+  const gpuFallbackReason = useSyncExternalStore(
+    subscribeGpuSearchFallbackReason,
+    getGpuSearchFallbackReason,
+    getGpuSearchFallbackReason,
+  );
+  const gpuSearchStatus = useSyncExternalStore(
+    subscribeGpuSearchFallbackReason,
+    getGpuSearchStatus,
+    getGpuSearchStatus,
+  );
+  useEffect(() => {
+    let active = true;
+    void probeGpuCapabilityOnce().then((capability) => {
+      if (active) setGpuCapability(capability);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
   const commit = useCallback(
     (patch: Partial<CraftBuddySettings>) => {
       const latest = getSettings();
@@ -354,17 +460,28 @@ export function SettingsBody({
     },
     [onSettingsChange, onSearchSettingsChange],
   );
-  const handleSliderCommit = (key: SearchSettingKey, value: number) =>
+  const handleSliderCommit = (key: SearchSettingKey, value: number) => {
+    if (!allowSliderCommit(key, gpuMode)) return;
     commit({ [key]: value });
+  };
   const handleOvercraftAmbitionChange = (value: boolean) =>
     commit({ overcraftAmbition: value });
   const budgets = SEARCH_PRESET_BUDGETS;
   const activePreset =
     PRESETS.find(({ id }) =>
-      Object.entries(budgets[id]).every(
-        ([key, value]) => settings[key as keyof CraftBuddySettings] === value,
-      ),
+      budgetMatchesSettings(budgets[id], settings, gpuMode),
     )?.id ?? '';
+  const gpuAvailability =
+    gpuCapability === null
+      ? 'WebGPU: проверяется…'
+      : gpuCapability.available
+        ? 'WebGPU: доступен'
+        : gpuCapability.reason;
+  const gpuStatusText = gpuFallbackReason
+    ? `${gpuAvailability} — ${gpuFallbackReason}`
+    : gpuSearchStatus
+      ? `${gpuAvailability} — ${gpuSearchStatus}`
+      : gpuAvailability;
 
   const exportSnapshot = async () => {
     const debug: unknown = (window as Window & { craftBuddyDebug?: unknown })
@@ -422,7 +539,9 @@ export function SettingsBody({
             label,
             detail: `up to ${(budgets[id].searchTimeBudgetMs / 1000).toFixed(1)} s`,
           }))}
-          onChange={(id) => commit(budgets[id as SearchPresetId])}
+          onChange={(id) =>
+            commit(presetChangePatch(budgets[id as SearchPresetId], gpuMode))
+          }
         />
         {!activePreset && (
           <Typography variant="body2" sx={{ color: colors.textMuted, mt: 1 }}>
@@ -551,6 +670,25 @@ export function SettingsBody({
           </Typography>
           <ChoiceGroup
             variant="pills"
+            label="Search engine"
+            value={settings.searchEngine}
+            options={SEARCH_ENGINE_OPTIONS}
+            onChange={(value) =>
+              commit(
+                engineChangePatch(value as CraftBuddySettings['searchEngine']),
+              )
+            }
+          />
+          <Typography
+            component="p"
+            role="status"
+            variant="body2"
+            sx={{ color: colors.textMuted, mt: 0.25, mb: 1.5 }}
+          >
+            {gpuStatusText}
+          </Typography>
+          <ChoiceGroup
+            variant="pills"
             label="Background workers"
             value={String(settings.searchThreads)}
             options={[
@@ -606,9 +744,11 @@ export function SettingsBody({
           <SliderSetting
             label="Branches to keep"
             tooltip="How many promising paths survive each search layer."
-            draftValue={settings.searchBeamWidth}
+            draftValue={gpuMode ? GPU_BEAM_WIDTH : settings.searchBeamWidth}
             min={3}
             max={20}
+            disabled={gpuMode}
+            note={gpuMode ? GPU_BEAM_NOTE : undefined}
             onCommit={(value) => handleSliderCommit('searchBeamWidth', value)}
           />
         </Disclosure>

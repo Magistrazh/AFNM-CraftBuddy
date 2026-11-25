@@ -234,7 +234,13 @@ interface ResolvedMasteryBonuses {
 const EMPTY_MASTERY_UPGRADES: MasteryUpgradeMap = Object.freeze({});
 
 function hasMasteryUpgrades(upgrades: MasteryUpgradeMap): boolean {
-  return Object.keys(upgrades).length > 0;
+  // Hot path: called per mastery application, thousands of times per search.
+  // `Object.keys().length` allocates an array each call, a for-in exits on the
+  // first key instead.
+  for (const key in upgrades) {
+    if (Object.prototype.hasOwnProperty.call(upgrades, key)) return true;
+  }
+  return false;
 }
 
 function applyMasteryUpgradesToScaling(
@@ -763,50 +769,124 @@ function seedBuffInternalState(
 function hasSealedMaxStabilityBuff(
   buffs: ReadonlyMap<string, { definition?: BuffDefinition }>,
 ): boolean {
-  return Array.from(buffs.values()).some(
-    (buff) => buff.definition?.sealedMaxStability === true,
-  );
+  let found = false;
+  buffs.forEach((buff) => {
+    if (!found && buff.definition?.sealedMaxStability === true) found = true;
+  });
+  return found;
+}
+
+/** Whether any held buff changes a cost channel. Loops instead of allocating. */
+function someCostAffectingBuff(
+  buffs: ReadonlyMap<string, { definition?: BuffDefinition }>,
+): boolean {
+  let found = false;
+  buffs.forEach((buff) => {
+    if (found) return;
+    const stats = buff.definition?.stats;
+    if (
+      stats?.poolCostFlat ||
+      stats?.qiCostReduction ||
+      stats?.qiCostPenalty ||
+      stats?.stabilityCostReduction ||
+      stats?.stabilityCostPenalty ||
+      stats?.poolCostPercentage ||
+      stats?.stabilityCostPercentage
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function hasPoolCostPercentageBuff(
+  buffs: ReadonlyMap<string, { definition?: BuffDefinition }>,
+): boolean {
+  let found = false;
+  buffs.forEach((buff) => {
+    if (!found && buff.definition?.stats?.poolCostPercentage !== undefined) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function hasStabilityCostPercentageBuff(
+  buffs: ReadonlyMap<string, { definition?: BuffDefinition }>,
+): boolean {
+  let found = false;
+  buffs.forEach((buff) => {
+    if (
+      !found &&
+      buff.definition?.stats?.stabilityCostPercentage !== undefined
+    ) {
+      found = true;
+    }
+  });
+  return found;
 }
 
 type NormalizedInterceptor = CraftingEffectInterceptor & {
   legacyPreventionLimit?: number;
 };
 
+const EMPTY_INTERCEPTORS: readonly NormalizedInterceptor[] = Object.freeze([]);
+const interceptorCache = new WeakMap<
+  BuffDefinition,
+  readonly NormalizedInterceptor[]
+>();
+
 /** Normalize old replay-only prevention into the 0.7.20 resource pipeline. */
 function getCraftingEffectInterceptors(
   definition: BuffDefinition | undefined,
 ): readonly NormalizedInterceptor[] {
-  const native = definition?.craftingEffectInterceptors ?? [];
-  const legacy = definition?.stabilityLossPrevention;
-  if (!legacy) return native;
-  return [
-    ...native,
-    {
-      legacyPreventionLimit: legacy.uses,
-      scope: 'resource',
-      appliesTo: ['stability'],
-      trigger: {
-        kind: 'condition',
-        condition: 'amount < 0 && preventedStabilityLosses < preventionLimit',
-      },
-      modifier: { kind: 'multiply', value: 0 },
-      effects: [
+  // Called per held buff on every numeric application; the definition is stable
+  // for the whole craft, so normalize it once per buff type.
+  if (!definition) return EMPTY_INTERCEPTORS;
+
+  const cached = interceptorCache.get(definition);
+  if (cached) return cached;
+
+  const native = definition.craftingEffectInterceptors ?? EMPTY_INTERCEPTORS;
+  const legacy = definition.stabilityLossPrevention;
+  const resolved: readonly NormalizedInterceptor[] = !legacy
+    ? native
+    : [
+        ...native,
         {
-          kind: 'setState',
-          key: 'preventedStabilityLosses',
-          mode: 'add',
-          value: { value: 1 },
+          legacyPreventionLimit: legacy.uses,
+          scope: 'resource',
+          appliesTo: ['stability'],
+          trigger: {
+            kind: 'condition',
+            condition:
+              'amount < 0 && preventedStabilityLosses < preventionLimit',
+          },
+          modifier: { kind: 'multiply', value: 0 },
+          effects: [
+            {
+              kind: 'setState',
+              key: 'preventedStabilityLosses',
+              mode: 'add',
+              value: { value: 1 },
+            },
+          ],
         },
-      ],
-    },
-  ];
+      ];
+
+  interceptorCache.set(definition, resolved);
+  return resolved;
 }
 
 /** Whether any held buff intercepts numeric applications in either scope. */
 function hasEffectInterceptors(buffs: ActiveBuffMap): boolean {
-  return Array.from(buffs.values()).some(
-    (buff) => getCraftingEffectInterceptors(buff.definition).length,
-  );
+  let found = false;
+  buffs.forEach((buff) => {
+    if (!found && getCraftingEffectInterceptors(buff.definition).length) {
+      found = true;
+    }
+  });
+  return found;
 }
 
 /** Runtime OC: snapshot order, live owners, first matching interceptor per buff. */
@@ -2525,18 +2605,7 @@ export function calculateEffectiveActionCosts(
   // Only run the heavier runtime-derivation path when active buffs
   // can actually modify costs. This avoids unnecessary overhead in search.
   if (config) {
-    const hasCostAffectingBuff = Array.from(activeBuffs.values()).some(
-      (tracked) =>
-        Boolean(
-          tracked.definition?.stats?.poolCostFlat ||
-          tracked.definition?.stats?.qiCostReduction ||
-          tracked.definition?.stats?.qiCostPenalty ||
-          tracked.definition?.stats?.stabilityCostReduction ||
-          tracked.definition?.stats?.stabilityCostPenalty ||
-          tracked.definition?.stats?.poolCostPercentage ||
-          tracked.definition?.stats?.stabilityCostPercentage,
-        ),
-    );
+    const hasCostAffectingBuff = someCostAffectingBuff(activeBuffs);
     const baseHarmonyMods = getHarmonyStatModifiers(
       state.harmonyData,
       config.craftingType,
@@ -2569,11 +2638,7 @@ export function calculateEffectiveActionCosts(
       // Compatibility percentages are not runtime cost channels. Their old
       // floor/ratio applies only on the side that actually has a legacy buff;
       // otherwise it would truncate a fractional modern baseline (84.5 -> 84).
-      if (
-        Array.from(activeBuffs.values()).some(
-          (buff) => buff.definition?.stats?.poolCostPercentage !== undefined,
-        )
-      ) {
+      if (hasPoolCostPercentageBuff(activeBuffs)) {
         legacyQiMultiplier =
           normalizeRuntimeCostPercentage(
             Math.floor(
@@ -2583,12 +2648,7 @@ export function calculateEffectiveActionCosts(
             ),
           ) / Math.max(1e-10, state.poolCostPercentage);
       }
-      if (
-        Array.from(activeBuffs.values()).some(
-          (buff) =>
-            buff.definition?.stats?.stabilityCostPercentage !== undefined,
-        )
-      ) {
+      if (hasStabilityCostPercentageBuff(activeBuffs)) {
         legacyStabilityMultiplier =
           normalizeRuntimeCostPercentage(
             Math.floor(

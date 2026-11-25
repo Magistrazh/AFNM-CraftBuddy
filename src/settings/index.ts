@@ -71,6 +71,8 @@ export interface CraftBuddySettings {
    * instantiates its own engine (a few MB of memory per thread).
    */
   searchThreads: SearchThreadCount;
+  /** Search backend selection. JS stays the default and the reference. */
+  searchEngine: SearchEngine;
   /** Preferred policy for per-craft automatic execution mode. */
   preferredAutoModePolicy: AutoCraftPolicy;
   /** Text size multiplier for CraftBuddy's own UI (1 = default). */
@@ -87,31 +89,48 @@ function normalizeUiTextScale(value: unknown): UiTextScale {
   );
 }
 
-export type SearchThreadCount = 1 | 2 | 4 | 'auto';
+export type SearchThreadCount = 1 | 2 | 4 | 8 | 12 | 'auto';
+
+export type SearchEngine = 'js' | 'gpu' | 'gpuVerified';
 
 /**
  * Resolve the effective worker count. `auto` leaves two cores for the game
- * and caps at 4; each worker carries its own search state. Unknown
+ * and caps at 12; each worker carries its own search state. Unknown
  * concurrency resolves conservatively to 1 (the pre-pool behaviour).
  */
 export function resolveSearchThreadCount(
   setting: SearchThreadCount,
   hardwareConcurrency?: number,
 ): number {
-  if (setting !== 'auto') {
-    return setting;
-  }
   const numeric = Number(hardwareConcurrency);
+  const usable = Number.isFinite(numeric) && numeric > 1 ? Math.floor(numeric) - 2 : 1;
+
+  if (setting !== 'auto') {
+    // A fixed choice still cannot exceed the machine: spawning workers that
+    // never get a core just adds memory and coordination cost.
+    return Math.max(1, Math.min(setting, usable));
+  }
   if (!Number.isFinite(numeric) || numeric < 1) {
     return 1;
   }
-  return Math.max(1, Math.min(Math.floor(numeric) - 2, 4));
+  return Math.max(1, Math.min(usable, 12));
 }
 
 function normalizeSearchThreadCount(value: unknown): SearchThreadCount {
-  return value === 1 || value === 2 || value === 'auto' || value === 4
+  return value === 1 ||
+    value === 2 ||
+    value === 4 ||
+    value === 8 ||
+    value === 12 ||
+    value === 'auto'
     ? value
     : DEFAULT_SETTINGS.searchThreads;
+}
+
+function normalizeSearchEngine(value: unknown): SearchEngine {
+  return value === 'js' || value === 'gpu' || value === 'gpuVerified'
+    ? value
+    : DEFAULT_SETTINGS.searchEngine;
 }
 
 export interface SearchThreadOption {
@@ -144,10 +163,24 @@ export const SEARCH_THREAD_OPTIONS: SearchThreadOption[] = [
     note: 'Highest parallelism and highest memory use.',
   },
   {
+    id: 8,
+    label: '8',
+    description:
+      'Splits the root candidates across eight workers and merges the ranked results.',
+    note: 'For many-core machines; each worker holds its own engine instance.',
+  },
+  {
+    id: 12,
+    label: '12',
+    description:
+      'Splits the root candidates across twelve workers and merges the ranked results.',
+    note: 'Highest parallelism; the root only has as many branches as techniques.',
+  },
+  {
     id: 'auto',
     label: 'Auto',
     description:
-      'Uses min(cores - 2, 4) workers, leaving headroom for the game itself.',
+      'Uses min(cores - 2, 12) workers, leaving headroom for the game itself.',
     note: 'Resolves at search time from navigator.hardwareConcurrency.',
   },
 ];
@@ -213,6 +246,8 @@ export const SEARCH_PRESET_BUDGETS: Record<SearchPresetId, SearchPresetBudget> =
  */
 export const AMBITION_BAND_MAX = 8;
 
+// Deliberately excludes `searchEngine`: the one-time reset rewrites effort
+// budgets only, and must not silently discard a saved backend selection.
 export const DEFAULT_SEARCH_SETTINGS: Pick<
   CraftBuddySettings,
   | 'lookaheadDepth'
@@ -241,6 +276,7 @@ const DEFAULT_SETTINGS: CraftBuddySettings = {
   showExpectedFinalState: true,
   showOptimalRotation: true,
   searchThreads: 1,
+  searchEngine: 'js',
   preferredAutoModePolicy: DEFAULT_AUTO_CRAFT_POLICY,
   uiTextScale: 1,
 };
@@ -357,6 +393,7 @@ function normalizeSettings(
 ): CraftBuddySettings {
   const settings = { ...migrateRetiredEngineBudget(storedSettings) };
   delete settings.optimizerEngine;
+  const searchEngine = normalizeSearchEngine(settings.searchEngine);
   const searchGoalPriorityBias =
     settings.searchGoalPriorityBias !== undefined
       ? clampSearchGoalPriorityBias(
@@ -388,8 +425,13 @@ function normalizeSettings(
       5000000,
       DEFAULT_SETTINGS.searchMaxNodes,
     ),
+    // The resident GPU kernel is compiled with BEAM=20. A saved GPU setup
+    // with another width would be refused at search time; pin it here so
+    // stored settings never disagree with the greyed-out UI.
     searchBeamWidth: clampInteger(
-      settings.searchBeamWidth,
+      searchEngine === 'gpu' || searchEngine === 'gpuVerified'
+        ? 20
+        : settings.searchBeamWidth,
       3,
       20,
       DEFAULT_SETTINGS.searchBeamWidth,
@@ -414,6 +456,7 @@ function normalizeSettings(
       DEFAULT_SETTINGS.completionBandCeiling,
     ),
     searchThreads: normalizeSearchThreadCount(settings.searchThreads),
+    searchEngine: searchEngine,
     preferredAutoModePolicy: normalizeAutoCraftPolicy(
       settings.preferredAutoModePolicy,
       DEFAULT_SETTINGS.preferredAutoModePolicy,

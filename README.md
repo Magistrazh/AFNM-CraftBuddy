@@ -1,77 +1,67 @@
-# CraftBuddy
+# AFNM CraftBuddy (GPU)
 
-A crafting assistant for **Ascend From Nine Mountains**. It reads your live craft, searches ahead and recommends the next technique, with optional auto-crafting.
+A crafting assistant for **Ascend From Nine Mountains** with an accelerated
+search backend that runs on the graphics processor. It shows the next action,
+its expected gains and costs, a multi-step plan, and alternative actions.
 
-CraftBuddy **7.2.0**, built for AFNM **0.7.21-6b1d439**. [What's changed](CHANGELOG.md).
+## Features
 
-![CraftBuddy Workshop preview](pictures/workshop_preview.png)
+- **WebGPU search backend.** Candidate construction and state evaluation are
+  moved to the GPU. A device-resident beam keeps states in device buffers
+  between levels and supports depth up to 96.
+- **The same settings as the normal search.** Depth, time budget, node limit and
+  beam width are read from the panel unchanged.
+- **Reliable fallback.** Any failure in the GPU path returns a refusal and falls
+  back to the normal search without throwing into the UI.
+- **Diagnostics.** Engine selection and plan recalculation are reported through
+  a local debug sink.
+- **Russian client.** Localized crafting labels are recognized.
 
-## Install
+The search architecture is documented in
+[docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md).
 
-Subscribe on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3661729323), or install manually:
+## Installation
 
-1. Download `afnm-craftbuddy.zip` from [GitHub Releases](https://github.com/lemon07r/AFNM-CraftBuddy/releases).
-2. Create a `mods` folder next to the game executable.
-3. Copy the zip into it **without unzipping**, then launch the game.
+1. Build the archive:
 
-## During a craft
+   ```bash
+   bun install
+   bun run build
+   ```
 
-The panel shows the next action with its gains and costs, the outcome it is working towards and upcoming conditions. The plan, other actions and automatic crafting sit in sections you can expand. It follows conditions, buffs, mastery, toxicity and all nine harmonies, and coexists with the game's native auto-use loadout rather than spending the same pill twice.
+2. Copy `builds/afnm-craftbuddy.zip` into the `mods` folder next to the game
+   executable, **without unzipping**.
+3. Launch the game.
 
-When random effects change the expected gains, a second compact line shows their expected value beneath the immediate gains. Actions whose gains come entirely from triggered effects show those expected gains as the main line, rather than suggesting they only prepare another turn.
+## Usage
 
-Outcome rows show the tier you are aiming for, each bar's bands and the bar holding the next tier back. Older results without an outcome projection show the available current completion and perfection against their recipe targets instead. There is no manual Finish button: crafts resolve when stability runs out or both bars reach their actual caps.
+Open the panel with `Ctrl+Shift+C`. In **Advanced search**, select the `GPU`
+engine, then press **Update plan** if the current plan is marked out of date.
 
-![CraftBuddy panel](pictures/gui.png)
+Selecting a GPU engine pins **Branches to keep** at 20 and greys the control out,
+because the compiled kernel requires that width. The field becomes editable
+again for the normal search.
 
-| Shortcut     | Action                                    |
-| ------------ | ----------------------------------------- |
-| Ctrl+Shift+C | Toggle panel                              |
-| Ctrl+Shift+M | Toggle compact mode                       |
-| Ctrl+Shift+Y | Export a replay snapshot for a bug report |
+## Measured result
 
-## Settings
+On the hardest scenario from the game files (`hardest-54`, 54 techniques):
 
-Open settings from the panel's gear icon or from CraftBuddy's entry in the game's mod options screen; both edit the same settings.
+| Source | Score | Time |
+|---|---:|---:|
+| Normal search, 60 s | −133 976 983.31 | 60 010 ms |
+| GPU mode, depth 96 | −21 072 985.93 | 550 ms |
 
-![CraftBuddy settings](pictures/settings.png)
-
-- **Fast** is the default preset. **Instant** uses the lowest budget; Balanced, High accuracy and Max spend more search effort. “Instant” is not a zero-latency guarantee.
-- Presets set all four **Advanced search** sliders (turns to look ahead, time per turn, states to explore, branches to keep) together. Raising one slider alone can waste work or reduce search quality; manual changes apply when you release the slider.
-- **Prefer perfection or completion** biases the search without changing tier requirements.
-- **Aim for extra bands** rewards progress beyond the secured tier. **Perfection band goal** asks for more perfection; **Completion band ceiling** stops rewarding completion beyond the chosen band, never below the tier requirement. Zero means Auto.
-- Band widths grow by 1.3×: two bands are about 230% of the recipe target, not 200%. Sublime requires two bands on each bar.
-- Recommendations use the established TypeScript search. Display options and background workers are also available.
-- **Display** can hide planned steps or the planned end state independently, and **Other actions to list** sets how many alternatives appear (0–5, default 1). Saved planned-step limits are still respected.
-
-Search stops at its time or node limit. Equal millisecond settings can reach different frontiers on different machines; reproducible comparisons use fixed node budgets with a nonbinding clock, not a promise that a preset always picks the same action.
-
-## Reporting a problem
-
-Press **Ctrl+Shift+Y during the craft** and attach the exported snapshot to a [GitHub issue](https://github.com/lemon07r/AFNM-CraftBuddy/issues). Include the action you expected and why; a replay is much more useful than a screenshot alone.
-
-Previews use expected values, not predictions of hidden rolls. The panel is English-only. Some runtime effects and the survivability floor remain approximate; [known gaps](docs/MECHANICS_PARITY.md#known-gaps) lists them explicitly.
+A higher score, meaning closer to zero, is better.
 
 ## Development
 
-Prerequisites: Bun; Python 3 for the optional UI harness. No Rust toolchain is needed.
-
 ```bash
-bun install
 bun run typecheck
+bun run test
 bun run build
 ```
 
-[Development guide](docs/DEVELOPMENT.md): module map, tests, runtime integration and validation. [Optimizer design](docs/OPTIMIZER_DESIGN.md) explains recommendation behavior. Agents can start with `AGENTS.md` and load only the relevant local skill.
-
-## Other mods
-
-- [ElderGPT Spirit Ring](https://github.com/lemon07r/ElderGPT-Spirit-Ring) — an AI-powered contextual advisor overlay.
-- [Lucky All Around](https://github.com/lemon07r/LuckyAllAround) — configurable pity-event luck weighting.
-- [All my AFNM mods](https://steamcommunity.com/sharedfiles/filedetails/?id=3704747572).
-
-Want to make a mod? [AFNM Agent Mod Template](https://github.com/lemon07r/AfnmAgentModTemplate) provides a starting scaffold.
-
 ## License
 
-MIT.
+MIT. Portions of the project are based on work by **lemon07r**; the original
+copyright notice is retained as required by the MIT license.

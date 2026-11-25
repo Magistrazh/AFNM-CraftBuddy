@@ -48,6 +48,13 @@ const CRAFTING_ACTION_PATTERNS = [
   /technique/,
   /crafting action/,
   /finish craft/,
+  // Russian client: the action row and category labels are localized.
+  /слияни/,
+  /очищени/,
+  /стабилизаци/,
+  /поддержк/,
+  /техник/,
+  /действие создания|завершить создание/,
 ];
 
 const PROGRESS_VALUE_PATTERN =

@@ -61,6 +61,12 @@ export interface IntegrationDiagnostics {
   searchBackendWorkerResultCount: number;
   /** Searches that fell back to the synchronous in-page engine. */
   searchBackendSyncFallbackCount: number;
+  /** One-line GPU profile from the last replay export. */
+  gpuProfileSummary: string;
+  /** Why a GPU search selection is not active; '' when no fallback. */
+  gpuSearchFallbackReason: string;
+  /** One-line status of the last GPU-assisted search; '' when unused. */
+  gpuSearchStatus: string;
 }
 
 export const integrationDiagnostics: IntegrationDiagnostics = {
@@ -101,4 +107,40 @@ export const integrationDiagnostics: IntegrationDiagnostics = {
   searchBackendProbeDetail: 'probe has not run yet',
   searchBackendWorkerResultCount: 0,
   searchBackendSyncFallbackCount: 0,
+  gpuProfileSummary: 'no gpu parity export yet',
+  gpuSearchFallbackReason: '',
+  gpuSearchStatus: '',
 };
+
+const gpuFallbackListeners = new Set<() => void>();
+
+export function getGpuSearchFallbackReason(): string {
+  return integrationDiagnostics.gpuSearchFallbackReason;
+}
+
+export function subscribeGpuSearchFallbackReason(
+  listener: () => void,
+): () => void {
+  gpuFallbackListeners.add(listener);
+  return () => {
+    gpuFallbackListeners.delete(listener);
+  };
+}
+
+/** Mirrors the reason into diagnostics and notifies the settings panel once. */
+export function setGpuSearchFallbackReason(reason: string): void {
+  if (integrationDiagnostics.gpuSearchFallbackReason === reason) return;
+  integrationDiagnostics.gpuSearchFallbackReason = reason;
+  gpuFallbackListeners.forEach((listener) => listener());
+}
+
+export function getGpuSearchStatus(): string {
+  return integrationDiagnostics.gpuSearchStatus;
+}
+
+/** Shares the fallback listeners: both fields feed one status line. */
+export function setGpuSearchStatus(status: string): void {
+  if (integrationDiagnostics.gpuSearchStatus === status) return;
+  integrationDiagnostics.gpuSearchStatus = status;
+  gpuFallbackListeners.forEach((listener) => listener());
+}

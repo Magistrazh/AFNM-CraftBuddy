@@ -7,6 +7,7 @@ import type {
   SkillRecommendation,
 } from '../optimizer';
 import type { HarmonyDataSource } from './harmonyState';
+import type { GpuParityReport } from '../optimizer/gpu';
 
 export interface OptimizerReplaySearchConfigSnapshot extends Pick<
   SearchConfig,
@@ -37,6 +38,8 @@ export interface OptimizerReplayInputSnapshot {
   };
   searchConfig: OptimizerReplaySearchConfigSnapshot;
   settings: {
+    /** Which engine produced this snapshot: js, gpu or gpuVerified. */
+    searchEngine?: string;
     lookaheadDepth: number;
     searchTimeBudgetMs: number;
     searchMaxNodes: number;
@@ -119,6 +122,8 @@ export interface OptimizerReplaySnapshot {
   recentTurns?: OptimizerReplayRecentTurnsSnapshot;
   input: OptimizerReplayInputSnapshot;
   output?: OptimizerReplayOutputSnapshot;
+  /** Added by the Ctrl+Shift+Y export after an in-game GPU parity run. */
+  gpu?: GpuParityReport;
   error?: string;
   completedAt?: string;
 }
@@ -184,6 +189,42 @@ export function sanitizeForJson(
   }
 
   return String(value);
+}
+
+/**
+ * Shape of the `optimizerSnapshot` debug event. The snapshot is the complete
+ * sanitized replay payload; the scalar fields are indexed copies so a reader
+ * can identify the turn without parsing the whole blob.
+ */
+export function buildOptimizerSnapshotDebugEvent(prepared: {
+  data: unknown;
+  json: string;
+}): Record<string, unknown> {
+  const snapshot = prepared.data;
+  const meta = snapshot as
+    | {
+        turn?: { sequence?: unknown; step?: unknown; capturedAt?: unknown };
+        input?: { searchEpoch?: unknown; createdAt?: unknown };
+      }
+    | null
+    | undefined;
+  const turn = meta?.turn;
+  const input = meta?.input;
+  const inputCreatedAt =
+    typeof input?.createdAt === 'string' ? input.createdAt : null;
+  const turnCapturedAt =
+    typeof turn?.capturedAt === 'string' ? turn.capturedAt : null;
+
+  return {
+    kind: 'optimizerSnapshot',
+    complete: true,
+    capturedAt: inputCreatedAt ?? turnCapturedAt,
+    sequence: typeof turn?.sequence === 'number' ? turn.sequence : null,
+    step: typeof turn?.step === 'number' ? turn.step : null,
+    searchEpoch: typeof input?.searchEpoch === 'number' ? input.searchEpoch : null,
+    snapshotBytes: JSON.stringify(snapshot).length,
+    snapshot,
+  };
 }
 
 function mapToPlainObject<T>(
