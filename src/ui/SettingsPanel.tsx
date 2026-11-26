@@ -785,7 +785,7 @@ export function SettingsBody({
               Discord
             </a>
             <a
-              href="https://github.com/lemon07r/AFNM-CraftBuddy"
+              href="https://github.com/Magistrazh/AFNM-CraftBuddy"
               target="_blank"
               rel="noopener noreferrer"
             >

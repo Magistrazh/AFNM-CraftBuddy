@@ -3,7 +3,7 @@
   "version": "7.3.0-GPU",
   "description": "Automatically calculates and displays the optimal next skill to use during crafting in Ascend From Nine Mountains",
   "author": {
-    "name": "lemon07r"
+    "name": "Magistrazh"
   },
   "main": "dist/mod.js",
   "scripts": {
