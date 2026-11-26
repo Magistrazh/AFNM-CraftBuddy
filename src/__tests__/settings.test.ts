@@ -467,11 +467,15 @@ describe('settings search budget', () => {
     expect(loaded.preferredAutoModePolicy).toBe(expected);
   });
 
-  it.each(['gpu', 'gpuVerified'] as const)(
-    'pins the beam width to 20 for a saved %s engine',
-    (engine) => {
+  it.each([
+    ['gpu', 'gpu'],
+    // Retired 'GPU + check' is migrated to plain GPU, never left hidden.
+    ['gpuVerified', 'gpu'],
+  ] as const)(
+    'pins the beam width to 20 for a saved %s engine (loads as %s)',
+    (stored, expected) => {
       storageData['craftbuddy_settings'] = JSON.stringify({
-        searchEngine: engine,
+        searchEngine: stored,
         searchBeamWidth: 9,
       });
       storageData[SEARCH_DEFAULTS_RESET_VERSION_KEY] =
@@ -481,7 +485,7 @@ describe('settings search budget', () => {
 
       const loaded = loadSettings();
 
-      expect(loaded.searchEngine).toBe(engine);
+      expect(loaded.searchEngine).toBe(expected);
       expect(loaded.searchBeamWidth).toBe(20);
     },
   );

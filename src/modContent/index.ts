@@ -42,12 +42,7 @@ import {
   type HarmonyData,
   type CraftingConditionType,
 } from '../optimizer';
-import {
-  buildParityReport,
-  describeProfile,
-  search,
-  type GpuParityReport,
-} from '../optimizer/gpu';
+import { describeProfile, search } from '../optimizer/gpu';
 import { RecommendationPanel } from '../ui/RecommendationPanel';
 import { createOverlayLayoutController } from '../ui/overlayLayoutController';
 import { CraftBuddyThemeProvider } from '../ui/ThemeProvider';
@@ -124,8 +119,6 @@ import {
   buildOptimizerSnapshotDebugEvent,
   buildResultSnapshot,
   buildStateSnapshot,
-  reviveConfigSnapshot,
-  reviveStateSnapshot,
   sanitizeForJson,
   type OptimizerReplayAutoCraftSnapshot,
   type OptimizerReplayInputSnapshot,
@@ -265,8 +258,6 @@ let autoCraftUiState: AutoCraftUiState = createDefaultAutoCraftUiState(
 // Calculation state tracking for loading indicator
 let isCalculating = false;
 let recommendationSearchEpoch = 0;
-/** `gpuVerified` runs its plain-engine comparison once per craft, not per step. */
-let verifiedCompareDoneForCraft = false;
 
 // Cross-step transposition cache for the synchronous search backend. One
 // instance here; the worker pool holds one per worker instead.
@@ -844,48 +835,6 @@ function emitOptimizerSnapshotDebugEvent(): void {
   emitDebugEvent(buildOptimizerSnapshotDebugEvent(prepared), {
     maxBodyLength: OPTIMIZER_SNAPSHOT_BODY_LIMIT,
   });
-}
-
-/**
- * Compute the GPU parity report for the state described by the snapshot that
- * is about to be exported. All failures stay in the report; nothing reaches
- * the hotkey handler as a rejected promise.
- */
-async function buildGpuParityForExport(): Promise<GpuParityReport> {
-  const snapshot = lastOptimizerReplaySnapshot;
-  let report: GpuParityReport;
-  if (!snapshot || !wasCraftingActive || !lastEntity || !lastProgressState) {
-    report = { available: false, reason: 'no craft' };
-  } else {
-    try {
-      report = await buildParityReport(
-        reviveStateSnapshot(snapshot.input.state),
-        reviveConfigSnapshot(snapshot.input.config),
-        snapshot.input.conditions.current,
-      );
-    } catch (error) {
-      report = {
-        available: false,
-        reason:
-          error instanceof Error
-            ? `${error.name}: ${error.message}`
-            : String(error),
-      };
-    }
-  }
-
-  emitDebugEvent({
-    kind: 'parity',
-    available: report.available,
-    reason: report.available ? null : report.reason,
-    compared: report.available ? report.compared : 0,
-    mismatches: report.available ? report.mismatches.length : 0,
-    roots: report.available ? (report.roots ?? []).map((root) => root.name) : [],
-    profile: report.profile ? describeProfile(report.profile) : null,
-    adapter: report.adapter ? { ...report.adapter } : null,
-  });
-
-  return report;
 }
 
 /**
@@ -1951,16 +1900,13 @@ function updateRecommendation(
       let rootSkillKeys = allSkillKeys;
       let effectiveSearchConfig = searchConfig;
       let hybridStatus = '';
-      let gpuTopName = '';
       let gpuPathRecommendation: SearchResult | null = null;
-      let gpuPathPickName = '';
       let gpuPathFallbackReason = '';
-      let gpuPathBackend = 'gpu-path';
 
       // S7b: the self-contained stateful search is the primary GPU proposal.
       // It owns its own refusals; a refusal leaves the old GPU/JS ladder below
       // completely unchanged. No exception reaches the recommendation UI.
-      if (engineAtStart === 'gpu' || engineAtStart === 'gpuVerified') {
+      if (engineAtStart === 'gpu') {
         let stateful:
           | Awaited<ReturnType<typeof tryGpuRecommendation>>
           | null = null;
@@ -1986,9 +1932,7 @@ function updateRecommendation(
         }
         if (stateful && stateful.ok) {
           gpuPathRecommendation = stateful.result;
-          gpuPathPickName = stateful.chosenName;
           gpuPathFallbackReason = '';
-          gpuPathBackend = 'gpu-stateful';
           hybridStatus = stateful.status;
           setGpuSearchStatus(hybridStatus);
           setGpuSearchFallbackReason('');
@@ -2000,10 +1944,7 @@ function updateRecommendation(
       // The GPU only proposes sequences. Every number shown to the player still
       // comes from the engine: replay verifies a proposal, then the engine runs
       // one search restricted to that proposal's opening.
-      if (
-        (engineAtStart === 'gpu' || engineAtStart === 'gpuVerified') &&
-        !gpuPathRecommendation
-      ) {
+      if (engineAtStart === 'gpu' && !gpuPathRecommendation) {
         try {
           const gpu = await search(state, config, config.skills, {
             currentCondition: currentConditionType,
@@ -2068,7 +2009,6 @@ function updateRecommendation(
             reason: gpuPathFallbackReason || null,
           });
           if (best && chosenSkill) {
-            gpuPathPickName = chosenSkill.name;
             gpuPathFallbackReason = '';
             // One normal engine search, restricted to the verified opening.
             gpuPathRecommendation = findBestSkill(
@@ -2145,7 +2085,6 @@ function updateRecommendation(
           hybridStatus = gpuPathFallbackReason
             ? `${selection.selection.status}; пути GPU: ${gpuPathFallbackReason}`
             : selection.selection.status;
-          gpuTopName = selection.selection.gpuTopName;
           effectiveSearchConfig = {
             ...searchConfig,
             timeBudgetMs: Math.min(
@@ -2183,10 +2122,8 @@ function updateRecommendation(
           : undefined,
       );
       let recommendation: SearchResult;
-      let backendKind: string;
       if (gpuPathRecommendation) {
         recommendation = gpuPathRecommendation;
-        backendKind = gpuPathBackend;
       } else {
         const backendInput: SearchBackendInput = {
           state,
@@ -2225,49 +2162,9 @@ function updateRecommendation(
                 forecastedConditionTypes,
                 searchConfig,
               );
-        backendKind = outcome.kind;
       }
       if (searchEpoch !== recommendationSearchEpoch) {
         return;
-      }
-      // 'GPU + check' runs one plain-engine search per craft and only reports
-      // agreement. Its result is discarded: the engine result chosen above is
-      // always the one shown and executed.
-      if (engineAtStart === 'gpuVerified' && !verifiedCompareDoneForCraft) {
-        verifiedCompareDoneForCraft = true;
-        const plain = findBestSkill(
-          state,
-          config,
-          targetCompletionAtSearchStart,
-          targetPerfectionAtSearchStart,
-          false,
-          lookaheadDepth,
-          currentConditionType,
-          forecastedConditionTypes,
-          searchConfig,
-        );
-        const enginePick = plain.recommendation?.skill.name ?? '';
-        const engineScore = plain.recommendation?.score ?? null;
-        const gpuPick = gpuPathPickName || gpuTopName;
-        const agree = Boolean(gpuPick) && enginePick === gpuPick;
-        gpuDebugLog(
-          `verified-compare enginePick=${enginePick} engineScore=${engineScore} gpuPick=${gpuPick} agree=${agree}`,
-        );
-        emitDebugEvent({
-          kind: 'verified-compare',
-          enginePick,
-          engineScore,
-          gpuPick,
-          agree,
-        });
-        // A used path already set its own status; keep it untouched.
-        if (!gpuPathRecommendation && gpuTopName) {
-          setGpuSearchStatus(
-            `${hybridStatus}, бюджет ${(effectiveSearchConfig.timeBudgetMs / 1000).toFixed(1)} с, сверка: ${
-              agree ? 'совпало' : `GPU ${gpuPick} ≠ ${enginePick || '—'}`
-            }`,
-          );
-        }
       }
 
       currentRecommendation = recommendation;
@@ -2300,31 +2197,6 @@ function updateRecommendation(
         score: recommendation.recommendation?.score ?? null,
       };
 
-      // Measurement hook: expose search cost so external tooling (the chat panel
-      // bridge) can compare thread counts without opening devtools.
-      const searchMetrics = recommendation.searchMetrics;
-      if (searchMetrics) {
-        const metricsWindow = window as unknown as {
-          __craftbuddyMetrics?: Array<Record<string, unknown>>;
-        };
-        const history = metricsWindow.__craftbuddyMetrics ?? [];
-        history.push({
-          at: Date.now(),
-          step: state.step,
-          threads,
-          backend: backendKind,
-          nodes: searchMetrics.nodesExplored,
-          cacheHits: searchMetrics.cacheHits,
-          timeMs: searchMetrics.timeTakenMs,
-          depth: searchMetrics.depthReached,
-          skills: config.skills.length,
-          recommended: recommendation.recommendation?.skill?.name ?? null,
-          earlyExit: searchMetrics.earlyExit?.reason ?? null,
-          stablePasses: searchMetrics.earlyExit?.stablePasses ?? null,
-        });
-        if (history.length > 200) history.splice(0, history.length - 200);
-        metricsWindow.__craftbuddyMetrics = history;
-      }
       currentOptimizerReplayTurn = {
         ...(currentOptimizerReplayTurn ?? {
           sequence: optimizerReplayTurnSequence,
@@ -2677,7 +2549,6 @@ function showOverlay({ sync = false }: { sync?: boolean } = {}): void {
  */
 function clearActiveCraftingRuntimeState(): void {
   recommendationSearchEpoch++;
-  verifiedCompareDoneForCraft = false;
   lastEntity = null;
   lastProgressState = null;
   lastKnownCraftingTechniques = undefined;
@@ -4372,15 +4243,8 @@ try {
   },
 
   exportOptimizerReplaySnapshot: async () => {
-    const gpu = await buildGpuParityForExport();
-    integrationDiagnostics.gpuProfileSummary = gpu.available
-      ? describeProfile(gpu.profile)
-      : `gpu unavailable: ${gpu.reason}`;
     const snapshot = lastOptimizerReplaySnapshot;
-    const data: OptimizerReplaySnapshot | { gpu: GpuParityReport } = snapshot
-      ? { ...snapshot, gpu }
-      : { gpu };
-    const json = JSON.stringify(sanitizeForJson(data), null, 2);
+    const json = JSON.stringify(sanitizeForJson(snapshot ?? {}), null, 2);
 
     const copied = await copyTextToClipboard(json);
     if (copied) {

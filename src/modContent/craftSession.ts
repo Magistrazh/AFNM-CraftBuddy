@@ -107,7 +107,7 @@ export const integrationDiagnostics: IntegrationDiagnostics = {
   searchBackendProbeDetail: 'probe has not run yet',
   searchBackendWorkerResultCount: 0,
   searchBackendSyncFallbackCount: 0,
-  gpuProfileSummary: 'no gpu parity export yet',
+  gpuProfileSummary: 'gpu parity export disabled for release',
   gpuSearchFallbackReason: '',
   gpuSearchStatus: '',
 };

@@ -40,19 +40,14 @@ describe('GPU beam lock', () => {
     logSpy.mockRestore();
   });
 
-  it('recognises both GPU engines but not JS', () => {
+  it('recognises the GPU engine but not JS', () => {
     expect(isGpuSearchEngine('gpu')).toBe(true);
-    expect(isGpuSearchEngine('gpuVerified')).toBe(true);
     expect(isGpuSearchEngine('js')).toBe(false);
   });
 
   it('writes 20 into the saved patch when a GPU engine is selected', () => {
     expect(engineChangePatch('gpu')).toEqual({
       searchEngine: 'gpu',
-      searchBeamWidth: GPU_BEAM_WIDTH,
-    });
-    expect(engineChangePatch('gpuVerified')).toEqual({
-      searchEngine: 'gpuVerified',
       searchBeamWidth: GPU_BEAM_WIDTH,
     });
     expect(engineChangePatch('js')).toEqual({ searchEngine: 'js' });

@@ -1,10 +1,10 @@
 /**
  * Live diagnostics transport: POSTs compact JSON events to a local receiver.
  *
- * Opt out with `window.__CRAFTBUDDY_DEBUG_SINK__ = false` (or `''`) before the
- * mod loads. Any other string overrides the base URL; the default is the
- * developer's local sink. When the receiver is down, every POST fails quietly
- * and the mod carries on unchanged.
+ * Disabled by default for release. Opt in before the mod loads with
+ * `window.__CRAFTBUDDY_DEBUG_SINK__ = true` (the local sink) or a URL string
+ * (any other string overrides the base URL). When the receiver is down, every
+ * POST fails quietly and the mod carries on unchanged.
  */
 
 import { emitDebugEvent, setDebugSink } from '../utils/debugSink';
@@ -35,7 +35,10 @@ export function initDebugSink(context: DebugBootContext): void {
   }
 
   let sinkUrl: string | null = null;
-  if (configured !== false && configured !== '') {
+  if (
+    configured === true ||
+    (typeof configured === 'string' && configured.trim().length > 0)
+  ) {
     const base =
       typeof configured === 'string' && configured.trim().length > 0
         ? configured.replace(/\/+$/, '')

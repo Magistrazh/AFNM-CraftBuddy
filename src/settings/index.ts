@@ -91,6 +91,7 @@ function normalizeUiTextScale(value: unknown): UiTextScale {
 
 export type SearchThreadCount = 1 | 2 | 4 | 8 | 12 | 'auto';
 
+/** `gpuVerified` is retired: tolerated in stored data, mapped to `gpu` on load. */
 export type SearchEngine = 'js' | 'gpu' | 'gpuVerified';
 
 /**
@@ -128,9 +129,10 @@ function normalizeSearchThreadCount(value: unknown): SearchThreadCount {
 }
 
 function normalizeSearchEngine(value: unknown): SearchEngine {
-  return value === 'js' || value === 'gpu' || value === 'gpuVerified'
-    ? value
-    : DEFAULT_SETTINGS.searchEngine;
+  // The retired 'GPU + check' option must never leave a user on a hidden
+  // engine: old saved settings are migrated to plain GPU, which stays usable.
+  if (value === 'gpuVerified') return 'gpu';
+  return value === 'js' || value === 'gpu' ? value : DEFAULT_SETTINGS.searchEngine;
 }
 
 export interface SearchThreadOption {
@@ -429,9 +431,7 @@ function normalizeSettings(
     // with another width would be refused at search time; pin it here so
     // stored settings never disagree with the greyed-out UI.
     searchBeamWidth: clampInteger(
-      searchEngine === 'gpu' || searchEngine === 'gpuVerified'
-        ? 20
-        : settings.searchBeamWidth,
+      searchEngine === 'gpu' ? 20 : settings.searchBeamWidth,
       3,
       20,
       DEFAULT_SETTINGS.searchBeamWidth,

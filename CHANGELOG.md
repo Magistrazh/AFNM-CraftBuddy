@@ -1,5 +1,12 @@
 # Changelog
 
+## 7.3.0-GPU — AFNM 0.7.21
+
+- Add a WebGPU search backend. Technique transitions and state evaluation run on the graphics processor, with a device-resident beam that keeps states in device buffers between levels and supports depth up to 96. The new engine uses the same mod settings as the normal search; no parallel search constants are introduced.
+- Route `lookaheadDepth > 2` to the resident backend and keep the existing stateful path for depth 2. Any GPU failure returns a refusal and falls through to the normal search without throwing into the UI.
+- Pin **Branches to keep** at 20 while a GPU engine is selected, because the compiled kernel requires that width. Saved settings are migrated on load.
+- Add GPU implementation, tests, and an architecture document. Set the project identity and license for this fork.
+
 ## 7.3.0 — AFNM 0.7.21
 
 - Move and resize the overlay: drag the header to place it, drag the bottom-left grip to resize it. The layout persists across sessions under its own storage key, is clamped back on screen when the resolution shrinks (and restored when it grows again), and Escape cancels a gesture. Double-click the header or use Settings › Appearance › Reset layout to return to the automatic, HUD-aware position, which stays the default.

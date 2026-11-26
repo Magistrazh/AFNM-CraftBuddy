@@ -82,7 +82,7 @@ describe('recalculate diagnostics', () => {
   it('emits a result event from the real recommendation outcome', () => {
     emitRecalculateResult({
       ok: true,
-      engine: 'gpuVerified',
+      engine: 'gpu',
       pick: 'Приём',
       score: 123.5,
       elapsedMs: 42,
@@ -92,7 +92,7 @@ describe('recalculate diagnostics', () => {
       kind: 'recalculateResult',
       trigger: 'settings',
       ok: true,
-      engine: 'gpuVerified',
+      engine: 'gpu',
       pick: 'Приём',
       score: 123.5,
       elapsedMs: 42,

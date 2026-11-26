@@ -7,7 +7,6 @@ import type {
   SkillRecommendation,
 } from '../optimizer';
 import type { HarmonyDataSource } from './harmonyState';
-import type { GpuParityReport } from '../optimizer/gpu';
 
 export interface OptimizerReplaySearchConfigSnapshot extends Pick<
   SearchConfig,
@@ -38,7 +37,7 @@ export interface OptimizerReplayInputSnapshot {
   };
   searchConfig: OptimizerReplaySearchConfigSnapshot;
   settings: {
-    /** Which engine produced this snapshot: js, gpu or gpuVerified. */
+    /** Which engine produced this snapshot: js or gpu. */
     searchEngine?: string;
     lookaheadDepth: number;
     searchTimeBudgetMs: number;
@@ -122,8 +121,6 @@ export interface OptimizerReplaySnapshot {
   recentTurns?: OptimizerReplayRecentTurnsSnapshot;
   input: OptimizerReplayInputSnapshot;
   output?: OptimizerReplayOutputSnapshot;
-  /** Added by the Ctrl+Shift+Y export after an in-game GPU parity run. */
-  gpu?: GpuParityReport;
   error?: string;
   completedAt?: string;
 }

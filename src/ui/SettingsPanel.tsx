@@ -105,11 +105,6 @@ const COMPLETION_BAND_CEILING_HELP =
 const SEARCH_ENGINE_OPTIONS = [
   { id: 'js', label: 'JS', detail: 'Default and reference engine.' },
   { id: 'gpu', label: 'GPU', detail: 'Experimental.' },
-  {
-    id: 'gpuVerified',
-    label: 'GPU + check',
-    detail: 'Compares with JS on the first search of a craft.',
-  },
 ] as const;
 
 // The probe is only run when settings are actually shown. Its result is cached

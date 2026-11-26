@@ -7,9 +7,9 @@ import type {
 /** The resident GPU kernel is compiled with this beam width. */
 export const GPU_BEAM_WIDTH = 20;
 
-/** Both GPU backends share one compiled kernel, so both need the same lock. */
+/** The resident GPU kernel is compiled with one beam width. */
 export function isGpuSearchEngine(engine: SearchEngine): boolean {
-  return engine === 'gpu' || engine === 'gpuVerified';
+  return engine === 'gpu';
 }
 
 /** Selecting an engine also pins the beam width when a GPU backend is chosen. */
